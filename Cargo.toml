@@ -1,0 +1,9 @@
+[package]
+name = "chop-chop-allocator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lock_api = "0.4.13"
+bitvec = { version = "1.0", default-features = false }
+anyhow = "1.0.98"
