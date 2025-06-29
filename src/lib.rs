@@ -133,19 +133,34 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         let size = layout.size().max(layout.align()).next_power_of_two();
         let order = size.trailing_zeros() as usize;
 
+        // Check if order is too large
+        if order >= MAX_ORDER {
+            return Err(BuddyAllocatorError::AllocationTooLarge {
+                requested_bytes: size,
+                max_block_size: 1 << (MAX_ORDER - 1),
+            });
+        }
+
         // Try to find a block of the exact size
         if let Some(block) = Self::pop_free_block(&mut guard.free_lists, order) {
+            self.set_block_free(&mut guard, block, order, false); // Mark as allocated!
             return Ok(block);
         }
 
         // Find a larger block and split it down
         for larger_order in (order + 1)..MAX_ORDER {
             if let Some(large_block) = Self::pop_free_block(&mut guard.free_lists, larger_order) {
-                return Ok(Self::split_block_down_to(&mut guard.free_lists, large_block, larger_order, order));
+                let allocated_block = Self::split_block_down_to(&mut guard.free_lists, large_block, larger_order, order);
+                self.set_block_free(&mut guard, allocated_block, order, false); // Mark as allocated!
+                return Ok(allocated_block);
             }
         }
 
-        todo!()
+        // No free blocks available
+        Err(BuddyAllocatorError::OutOfMemory {
+            requested_order: order,
+            largest_available_order: None, // TODO: Could scan for largest available
+        })
     }
 
     /// Try to deallocate memory at the given pointer
