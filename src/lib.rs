@@ -150,7 +150,7 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         // Find a larger block and split it down
         for larger_order in (order + 1)..MAX_ORDER {
             if let Some(large_block) = Self::pop_free_block(&mut guard.free_lists, larger_order) {
-                let allocated_block = Self::split_block_down_to(&mut guard.free_lists, large_block, larger_order, order);
+                let allocated_block = self.split_block_down_to(&mut guard, large_block, larger_order, order);
                 self.set_block_free(&mut guard, allocated_block, order, false); // Mark as allocated!
                 return Ok(allocated_block);
             }
@@ -311,7 +311,8 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
 
     /// Split a large block down to the target order
     fn split_block_down_to(
-        free_lists: &mut [Option<NonNull<FreeBlock>>; MAX_ORDER],
+        &self,
+        inner: &mut BuddyAllocatorInner<MAX_ORDER>,
         mut block: NonNull<u8>,
         from_order: usize,
         to_order: usize
@@ -319,19 +320,16 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         let mut current_order = from_order;
         let current_block = block;
 
-        // Split repeatedly until we reach the target size
         while current_order > to_order {
             current_order -= 1;
-            let block_size = 1 << current_order; // 2^current_order
+            let block_size = 1 << current_order;
 
-            // Calculate buddy address using XOR magic!
             let buddy_addr = current_block.as_ptr() as usize ^ block_size;
             let buddy_ptr = NonNull::new(buddy_addr as *mut u8).unwrap();
 
-            // Put the buddy on the appropriate free list
-            Self::push_free_block(free_lists, buddy_ptr, current_order);
-
-            // Keep the first half for further splitting
+            // ✅ NOW we can mark the buddy as free in the bitmap!
+            self.set_block_free(inner, buddy_ptr, current_order, true);
+            Self::push_free_block(&mut inner.free_lists, buddy_ptr, current_order);
         }
 
         current_block
