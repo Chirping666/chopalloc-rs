@@ -1,7 +1,5 @@
 #![no_std]
 mod raw_spin_lock;
-#[cfg(test)]
-mod tests;
 mod errors;
 
 use core::ptr::NonNull;
@@ -67,15 +65,45 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         // Initialize all bits to 0 (allocated)
         bitmap_storage.fill(0);
 
-        Ok(Self {
-            inner: Mutex::new(BuddyAllocatorInner {
-                free_lists: [None; MAX_ORDER],
-                bitmap_storage,
-                bitmap_offsets,
-            }),
+        let mut inner = BuddyAllocatorInner {
+            free_lists: [None; MAX_ORDER],
+            bitmap_storage,
+            bitmap_offsets,
+        };
+
+        let allocator = Self {
+            inner: Mutex::new(inner),
             base_addr: memory_region,
             total_size: memory_size,
-        })
+        };
+
+        // Initialize with one giant free block
+        allocator.initialize_free_memory()?;
+
+        Ok(allocator)
+    }
+
+    fn initialize_free_memory(&self) -> Result<()> {
+        let mut guard = self.inner.lock();
+        let mut remaining_size = self.total_size;
+        let mut current_addr = self.base_addr.as_ptr() as usize;
+
+        while remaining_size > 0 {
+            // Find largest power-of-2 block that fits
+            let block_order = remaining_size.trailing_zeros() as usize;
+            let block_order = block_order.min(MAX_ORDER - 1);
+            let block_size = 1 << block_order;
+
+            let block_ptr = NonNull::new(current_addr as *mut u8).unwrap();
+
+            self.set_block_free(&mut guard, block_ptr, block_order, true);
+            Self::push_free_block(&mut guard.free_lists, block_ptr, block_order);
+
+            current_addr += block_size;
+            remaining_size -= block_size;
+        }
+
+        Ok(())
     }
 
     pub fn calculate_bitmap_words_needed(memory_size: usize) -> usize {
@@ -122,18 +150,109 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
 
     /// Try to deallocate memory at the given pointer
     pub fn try_deallocate(&self, ptr: NonNull<u8>, layout: Layout) -> Result<()> {
-        let _guard = self.inner.lock();
+        let mut guard = self.inner.lock();
 
         let size = layout.size().max(layout.align()).next_power_of_two();
         let order = size.trailing_zeros() as usize;
 
-        // TODO: Implement deallocation with buddy merging
-        // 1. Mark block as free
-        // 2. Find buddy using XOR
-        // 3. If buddy is free, merge and repeat
-        // 4. Add final block to appropriate free list
+        // Validation
+        let ptr_addr = ptr.as_ptr() as usize;
+        let base_addr = self.base_addr.as_ptr() as usize;
+
+        if ptr_addr < base_addr || ptr_addr >= base_addr + self.total_size {
+            return Err(BuddyAllocatorError::InvalidPointer {
+                ptr, base_addr: self.base_addr, region_size: self.total_size,
+            });
+        }
+
+        let block_size = 1 << order;
+        if (ptr_addr - base_addr) % block_size != 0 {
+            return Err(BuddyAllocatorError::InvalidAlignment {
+                ptr, block_size, required_alignment: block_size,
+            });
+        }
+
+        if self.is_block_free(&guard, ptr, order) {
+            return Err(BuddyAllocatorError::DoubleFree { ptr, order });
+        }
+
+        // Mark block as free
+        self.set_block_free(&mut guard, ptr, order, true);
+
+        // Buddy merging loop
+        let mut current_ptr = ptr;
+        let mut current_order = order;
+
+        while current_order < MAX_ORDER - 1 {
+            let buddy_addr = current_ptr.as_ptr() as usize ^ (1 << current_order);
+            let buddy_ptr = NonNull::new(buddy_addr as *mut u8).unwrap();
+
+            if !self.is_block_free(&guard, buddy_ptr, current_order) {
+                break;
+            }
+
+            let removed = Self::remove_from_free_list(&mut guard.free_lists, buddy_ptr, current_order);
+            debug_assert!(removed, "Bitmap-freelist inconsistency");
+
+            self.set_block_free(&mut guard, buddy_ptr, current_order, false);
+
+            current_ptr = if current_ptr.as_ptr() < buddy_ptr.as_ptr() {
+                current_ptr
+            } else {
+                buddy_ptr
+            };
+            current_order += 1;
+        }
+
+        Self::push_free_block(&mut guard.free_lists, current_ptr, current_order);
 
         Ok(())
+    }
+
+    fn remove_from_free_list(
+        free_lists: &mut [Option<NonNull<FreeBlock>>; MAX_ORDER],
+        target: NonNull<u8>,
+        order: usize
+    ) -> bool {
+        if order >= MAX_ORDER {
+            return false;
+        }
+
+        let target_block = target.cast::<FreeBlock>();
+
+        // Handle empty list case
+        let head = match free_lists[order] {
+            Some(h) => h,
+            None => return false, // Can't remove from empty list
+        };
+
+        unsafe {
+            // Handle removing the head of the list
+            if head == target_block {
+                free_lists[order] = head.as_ref().next;
+                return true;
+            }
+
+            // Search through the rest of the list
+            let mut current = head;
+            loop {
+                let next_ptr = match current.as_ref().next {
+                    Some(next) => next,
+                    None => break, // End of list, target not found
+                };
+
+                if next_ptr == target_block {
+                    // Found it! Update current's next to skip over target
+                    let target_next = next_ptr.as_ref().next;
+                    current.as_mut().next = target_next;
+                    return true;
+                }
+
+                current = next_ptr;
+            }
+        }
+
+        false // Not found in list
     }
 
     /// Remove and return a block from the free list of given order
@@ -247,6 +366,44 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         } else {
             // Clear the bit: AND with a mask that has 0 in target position, 1s elsewhere
             inner.bitmap_storage[word_offset] &= !(1u64 << bit_position);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::alloc::Layout;
+    use core::ptr;
+
+    #[test]
+    fn test_buddy_merging_cascade() {
+        static mut MEMORY: [u8; 1024] = [0; 1024];
+        static mut BITMAP: [u64; 100] = [0; 100];
+
+        unsafe {
+            // Use addr_of_mut! to get raw pointers, then convert to NonNull
+            let memory_ptr = NonNull::new(ptr::addr_of_mut!(MEMORY).cast::<u8>()).unwrap();
+            let bitmap_slice = core::slice::from_raw_parts_mut(
+                ptr::addr_of_mut!(BITMAP).cast::<u64>(),
+                100
+            );
+
+            let allocator = BuddyAllocator::<10>::new(memory_ptr, 1024, bitmap_slice).unwrap();
+
+            // Test the buddy merging cascade
+            let layout_64 = Layout::from_size_align(64, 64).unwrap();
+            let ptr1 = allocator.try_allocate(layout_64).unwrap();
+            let ptr2 = allocator.try_allocate(layout_64).unwrap();
+
+            // Free in reverse order to trigger merging
+            allocator.try_deallocate(ptr2, layout_64).unwrap();
+            allocator.try_deallocate(ptr1, layout_64).unwrap();
+
+            // Should be able to allocate full block again
+            let layout_1024 = Layout::from_size_align(1024, 1024).unwrap();
+            let big_ptr = allocator.try_allocate(layout_1024);
+            assert!(big_ptr.is_ok(), "Should be able to allocate 1024 bytes after merging");
         }
     }
 }
