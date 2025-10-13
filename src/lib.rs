@@ -45,6 +45,14 @@ pub struct BuddyAllocator<const MAX_ORDER: usize> {
 }
 
 impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
+    /// Creates a new [`BuddyAllocator`] with the provided backing memory and bitmap storage.
+    ///
+    /// # Alignment
+    ///
+    /// The `memory_region` supplied must be aligned to the allocator's largest block size
+    /// (returned by [`Self::largest_block_size`]). Callers should ensure their backing storage
+    /// is prepared with this alignment before constructing the allocator; otherwise the
+    /// allocator will return [`BuddyAllocatorError::InvalidMemoryRegion`].
     pub fn new(
         memory_region: NonNull<u8>,
         memory_size: usize,
@@ -66,19 +74,6 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
                 reason: "memory size must be greater than zero",
             });
         }
-
-        let mut bitmap_offsets = [0; MAX_ORDER];
-        let mut current_offset = 0;
-
-        // Calculate the starting offset for each order's bitmap
-        for order in 0..MAX_ORDER {
-            // This order's bitmap starts at the current offset
-            bitmap_offsets[order] = current_offset;
-
-            // Calculate how many words this order needs
-            let block_size = 1 << order;
-            let blocks_count = memory_size / block_size;
-            let words_for_this_order = (blocks_count + 63) / 64;
 
         let bitmap_offsets = Self::build_bitmap_offsets(memory_size, bitmap_storage.len())?;
 
@@ -152,6 +147,14 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
                 base_addr: memory_region,
                 size: memory_size,
                 reason: "memory size must be a multiple of the largest block size",
+            });
+        }
+
+        if (memory_region.as_ptr() as usize) % largest_block_size != 0 {
+            return Err(BuddyAllocatorError::InvalidMemoryRegion {
+                base_addr: memory_region,
+                size: memory_size,
+                reason: "memory region must be aligned to the largest block size",
             });
         }
 
@@ -229,8 +232,6 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
             if block_size > memory_size {
                 break;
             }
-        for order in 0..MAX_ORDER {
-            let block_size = 1 << order; // 2^order bytes per block
 
             let blocks_count = memory_size / block_size;
             let words_for_this_order = (blocks_count + 63) / 64;
@@ -485,7 +486,6 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         order: usize,
     ) -> bool {
         if order >= MAX_ORDER || order < Self::min_order() {
-        if order >= MAX_ORDER {
             return false;
         }
 
@@ -507,7 +507,6 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         is_free: bool,
     ) {
         if order >= MAX_ORDER || order < Self::min_order() {
-        if order >= MAX_ORDER {
             return;
         }
 
@@ -586,23 +585,24 @@ mod tests {
     use core::alloc::Layout;
     use core::ptr;
 
+    #[repr(align(1024))]
+    struct AlignedMemory([u8; 1024]);
+
     #[test]
     fn test_buddy_merging_cascade() {
-        static mut MEMORY: [usize; 1024 / core::mem::size_of::<usize>()] =
-            [0; 1024 / core::mem::size_of::<usize>()];
+        static mut MEMORY: AlignedMemory = AlignedMemory([0; 1024]);
         static mut BITMAP: [u64; 64] = [0; 64];
 
         unsafe {
             // Use addr_of_mut! to get raw pointers, then convert to NonNull
-            let memory_ptr = NonNull::new(ptr::addr_of_mut!(MEMORY).cast::<u8>()).unwrap();
+            let memory_ptr =
+                NonNull::new(ptr::addr_of_mut!(MEMORY.0).cast::<u8>()).unwrap();
             let bitmap_words = BuddyAllocator::<11>::calculate_bitmap_words_needed(1024);
             assert!(bitmap_words <= 64);
             let bitmap_slice = core::slice::from_raw_parts_mut(
                 ptr::addr_of_mut!(BITMAP).cast::<u64>(),
                 bitmap_words,
             );
-            let bitmap_slice =
-                core::slice::from_raw_parts_mut(ptr::addr_of_mut!(BITMAP).cast::<u64>(), 100);
 
             let allocator = BuddyAllocator::<11>::new(memory_ptr, 1024, bitmap_slice).unwrap();
 
