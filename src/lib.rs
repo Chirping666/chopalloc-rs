@@ -15,6 +15,18 @@ struct FreeBlock {
     next: Option<NonNull<FreeBlock>>,
 }
 
+impl FreeBlock {
+    #[inline]
+    fn min_block_size() -> usize {
+        core::mem::size_of::<FreeBlock>().next_power_of_two()
+    }
+
+    #[inline]
+    fn min_order() -> usize {
+        FreeBlock::min_block_size().trailing_zeros() as usize
+    }
+}
+
 // Inner allocator state protected by mutex
 // `MAX_ORDER` represents the number of order levels managed by the allocator.
 // Valid block orders therefore range from 0 up to `MAX_ORDER - 1`.
@@ -38,6 +50,7 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         memory_size: usize,
         bitmap_storage: &'static mut [u64],
     ) -> Result<Self> {
+        Self::validate_configuration(memory_region, memory_size)?;
         if MAX_ORDER == 0 {
             return Err(BuddyAllocatorError::InvalidMemoryRegion {
                 base_addr: memory_region,
@@ -67,18 +80,7 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
             let blocks_count = memory_size / block_size;
             let words_for_this_order = (blocks_count + 63) / 64;
 
-            // Next order starts after this order's words
-            current_offset += words_for_this_order;
-        }
-
-        // Validate total storage
-        let total_words_needed = current_offset;
-        if bitmap_storage.len() < total_words_needed {
-            return Err(BuddyAllocatorError::BitmapStorageTooSmall {
-                required_words: total_words_needed,
-                provided_words: bitmap_storage.len(),
-            });
-        }
+        let bitmap_offsets = Self::build_bitmap_offsets(memory_size, bitmap_storage.len())?;
 
         // Initialize all bits to 0 (allocated)
         bitmap_storage.fill(0);
@@ -95,48 +97,143 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
             total_size: memory_size,
         };
 
-        // Initialize with one giant free block
+        // Initialize with top-level free blocks
         allocator.initialize_free_memory()?;
 
         Ok(allocator)
     }
 
+    fn validate_configuration(memory_region: NonNull<u8>, memory_size: usize) -> Result<()> {
+        if MAX_ORDER == 0 {
+            return Err(BuddyAllocatorError::InvalidMemoryRegion {
+                base_addr: memory_region,
+                size: memory_size,
+                reason: "MAX_ORDER must be at least 1",
+            });
+        }
+
+        if MAX_ORDER > usize::BITS as usize {
+            return Err(BuddyAllocatorError::InvalidMemoryRegion {
+                base_addr: memory_region,
+                size: memory_size,
+                reason: "MAX_ORDER exceeds native pointer width",
+            });
+        }
+
+        if memory_size == 0 {
+            return Err(BuddyAllocatorError::InvalidMemoryRegion {
+                base_addr: memory_region,
+                size: memory_size,
+                reason: "memory size must be greater than zero",
+            });
+        }
+
+        let min_order = Self::min_order();
+        if min_order >= MAX_ORDER {
+            return Err(BuddyAllocatorError::InvalidMemoryRegion {
+                base_addr: memory_region,
+                size: memory_size,
+                reason: "MAX_ORDER is too small for allocator metadata",
+            });
+        }
+
+        let min_block_size = Self::min_block_size();
+        if memory_size % min_block_size != 0 {
+            return Err(BuddyAllocatorError::InvalidMemoryRegion {
+                base_addr: memory_region,
+                size: memory_size,
+                reason: "memory size must be a multiple of the minimum block size",
+            });
+        }
+
+        let largest_block_size = Self::largest_block_size();
+        if memory_size % largest_block_size != 0 {
+            return Err(BuddyAllocatorError::InvalidMemoryRegion {
+                base_addr: memory_region,
+                size: memory_size,
+                reason: "memory size must be a multiple of the largest block size",
+            });
+        }
+
+        if (memory_region.as_ptr() as usize) % core::mem::align_of::<FreeBlock>() != 0 {
+            return Err(BuddyAllocatorError::InvalidMemoryRegion {
+                base_addr: memory_region,
+                size: memory_size,
+                reason: "memory region is not aligned for allocator metadata",
+            });
+        }
+
+        Ok(())
+    }
+
+    fn build_bitmap_offsets(memory_size: usize, bitmap_words: usize) -> Result<[usize; MAX_ORDER]> {
+        let mut bitmap_offsets = [0; MAX_ORDER];
+        let mut current_offset = 0;
+        let largest_block_size = Self::largest_block_size();
+        let min_order = Self::min_order();
+
+        for order in min_order..MAX_ORDER {
+            let block_size = 1 << order;
+            if block_size > largest_block_size {
+                break;
+            }
+
+            bitmap_offsets[order] = current_offset;
+            let blocks_count = memory_size / block_size;
+            let words_for_this_order = (blocks_count + 63) / 64;
+            current_offset += words_for_this_order;
+        }
+
+        if bitmap_words < current_offset {
+            return Err(BuddyAllocatorError::BitmapStorageTooSmall {
+                required_words: current_offset,
+                provided_words: bitmap_words,
+            });
+        }
+
+        Ok(bitmap_offsets)
+    }
+
     fn initialize_free_memory(&self) -> Result<()> {
         let mut guard = self.inner.lock();
-        let mut remaining_size = self.total_size;
+        let largest_block_order = Self::largest_order();
+        let largest_block_size = Self::largest_block_size();
+        debug_assert!(self.total_size % largest_block_size == 0);
+
         let mut current_addr = self.base_addr.as_ptr() as usize;
+        let end_addr = current_addr + self.total_size;
 
-        while remaining_size > 0 {
-            // Find largest power-of-2 block that fits
-            let block_order = remaining_size.trailing_zeros() as usize;
-            let block_order = block_order.min(MAX_ORDER - 1);
-            let block_size = 1 << block_order;
-
+        while current_addr < end_addr {
             let block_ptr = NonNull::new(current_addr as *mut u8).unwrap();
-
-            self.set_block_free(&mut guard, block_ptr, block_order, true);
-            Self::push_free_block(&mut guard.free_lists, block_ptr, block_order);
-
-            current_addr += block_size;
-            remaining_size -= block_size;
+            self.set_block_free(&mut guard, block_ptr, largest_block_order, true);
+            Self::push_free_block(&mut guard.free_lists, block_ptr, largest_block_order);
+            current_addr += largest_block_size;
         }
 
         Ok(())
     }
 
     pub fn calculate_bitmap_words_needed(memory_size: usize) -> usize {
-        let mut total_words = 0;
+        if memory_size == 0 {
+            return 0;
+        }
 
+        if memory_size % Self::min_block_size() != 0 {
+            return 0;
+        }
+
+        let min_order = Self::min_order();
+        let mut total_words = 0;
+        for order in min_order..MAX_ORDER {
+            let block_size = 1 << order;
+            if block_size > memory_size {
+                break;
+            }
         for order in 0..MAX_ORDER {
             let block_size = 1 << order; // 2^order bytes per block
 
-            // How many blocks of this size fit in our memory?
             let blocks_count = memory_size / block_size;
-
-            // How many u64 words do we need to store this many bits?
-            // Each u64 can store 64 bits, so we round up
             let words_for_this_order = (blocks_count + 63) / 64;
-
             total_words += words_for_this_order;
         }
 
@@ -145,18 +242,8 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
 
     /// Try to allocate memory matching the given layout
     pub fn try_allocate(&self, layout: Layout) -> Result<NonNull<u8>> {
+        let (_, order) = self.normalize_layout(layout)?;
         let mut guard = self.inner.lock();
-
-        let size = layout.size().max(layout.align()).next_power_of_two();
-        let order = size.trailing_zeros() as usize;
-
-        // Check if order is too large
-        if order >= MAX_ORDER {
-            return Err(BuddyAllocatorError::AllocationTooLarge {
-                requested_bytes: size,
-                max_block_size: 1 << (MAX_ORDER - 1),
-            });
-        }
 
         // Try to find a block of the exact size
         if let Some(block) = Self::pop_free_block(&mut guard.free_lists, order) {
@@ -177,16 +264,14 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         // No free blocks available
         Err(BuddyAllocatorError::OutOfMemory {
             requested_order: order,
-            largest_available_order: None, // TODO: Could scan for largest available
+            largest_available_order: Self::largest_available_order(&guard),
         })
     }
 
     /// Try to deallocate memory at the given pointer
     pub fn try_deallocate(&self, ptr: NonNull<u8>, layout: Layout) -> Result<()> {
+        let (_, order) = self.normalize_layout(layout)?;
         let mut guard = self.inner.lock();
-
-        let size = layout.size().max(layout.align()).next_power_of_two();
-        let order = size.trailing_zeros() as usize;
 
         // Validation
         let ptr_addr = ptr.as_ptr() as usize;
@@ -264,7 +349,7 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         target: NonNull<u8>,
         order: usize,
     ) -> bool {
-        if order >= MAX_ORDER {
+        if order >= MAX_ORDER || order < Self::min_order() {
             return false;
         }
 
@@ -310,7 +395,7 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         free_lists: &mut [Option<NonNull<FreeBlock>>; MAX_ORDER],
         order: usize,
     ) -> Option<NonNull<u8>> {
-        if order >= MAX_ORDER {
+        if order >= MAX_ORDER || order < Self::min_order() {
             return None;
         }
 
@@ -332,11 +417,15 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         ptr: NonNull<u8>,
         order: usize,
     ) {
-        if order >= MAX_ORDER {
+        if order >= MAX_ORDER || order < Self::min_order() {
             return;
         }
 
         unsafe {
+            debug_assert_eq!(
+                (ptr.as_ptr() as usize) % core::mem::align_of::<FreeBlock>(),
+                0
+            );
             // Convert the memory into a FreeBlock node
             let free_block = ptr.cast::<FreeBlock>().as_mut();
             free_block.next = free_lists[order];
@@ -363,10 +452,13 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
 
             let buddy_ptr =
                 unsafe { NonNull::new_unchecked(current_block.as_ptr().add(block_size)) };
+            let buddy_offset = buddy_ptr.as_ptr() as usize - self.base_addr.as_ptr() as usize;
+            debug_assert!(buddy_offset < self.total_size);
 
             // ✅ NOW we can mark the buddy as free in the bitmap!
             self.set_block_free(inner, buddy_ptr, current_order, true);
             Self::push_free_block(&mut inner.free_lists, buddy_ptr, current_order);
+            self.set_block_free(inner, current_block, current_order, false);
         }
 
         current_block
@@ -376,6 +468,8 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
     fn get_bit_index(&self, addr: NonNull<u8>, order: usize) -> usize {
         let offset_from_base = addr.as_ptr() as usize - self.base_addr.as_ptr() as usize;
         let block_size = 1 << order; // 2^order
+        debug_assert!(offset_from_base < self.total_size);
+        debug_assert_eq!(offset_from_base % block_size, 0);
         offset_from_base / block_size
     }
 
@@ -390,6 +484,7 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         addr: NonNull<u8>,
         order: usize,
     ) -> bool {
+        if order >= MAX_ORDER || order < Self::min_order() {
         if order >= MAX_ORDER {
             return false;
         }
@@ -397,6 +492,7 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         let bit_index = self.get_bit_index(addr, order);
         let word_offset = inner.bitmap_offsets[order] + bit_index / 64;
         let bit_position = bit_index % 64;
+        debug_assert!(word_offset < inner.bitmap_storage.len());
 
         // Extract the bit: shift right, then mask with 1
         (inner.bitmap_storage[word_offset] >> bit_position) & 1 == 1
@@ -410,6 +506,7 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         order: usize,
         is_free: bool,
     ) {
+        if order >= MAX_ORDER || order < Self::min_order() {
         if order >= MAX_ORDER {
             return;
         }
@@ -417,6 +514,7 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         let bit_index = self.get_bit_index(addr, order);
         let word_offset = inner.bitmap_offsets[order] + bit_index / 64;
         let bit_position = bit_index % 64;
+        debug_assert!(word_offset < inner.bitmap_storage.len());
 
         if is_free {
             // Set the bit: OR with a mask that has 1 in the target position
@@ -425,6 +523,60 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
             // Clear the bit: AND with a mask that has 0 in target position, 1s elsewhere
             inner.bitmap_storage[word_offset] &= !(1u64 << bit_position);
         }
+    }
+
+    fn min_order() -> usize {
+        FreeBlock::min_order()
+    }
+
+    fn min_block_size() -> usize {
+        FreeBlock::min_block_size()
+    }
+
+    fn largest_order() -> usize {
+        MAX_ORDER - 1
+    }
+
+    fn largest_block_size() -> usize {
+        1 << Self::largest_order()
+    }
+
+    fn normalize_layout(&self, layout: Layout) -> Result<(usize, usize)> {
+        if layout.size() == 0 {
+            return Err(BuddyAllocatorError::InvalidLayout {
+                size: layout.size(),
+                align: layout.align(),
+                reason: "zero-sized allocations are not supported",
+            });
+        }
+
+        let mut requested = layout.size().max(layout.align());
+        requested = requested.max(Self::min_block_size());
+
+        if requested > Self::largest_block_size() {
+            return Err(BuddyAllocatorError::AllocationTooLarge {
+                requested_bytes: requested,
+                max_block_size: Self::largest_block_size(),
+            });
+        }
+
+        let size = requested.next_power_of_two();
+        let order = size.trailing_zeros() as usize;
+
+        if order >= MAX_ORDER {
+            return Err(BuddyAllocatorError::AllocationTooLarge {
+                requested_bytes: size,
+                max_block_size: Self::largest_block_size(),
+            });
+        }
+
+        Ok((size, order))
+    }
+
+    fn largest_available_order(inner: &BuddyAllocatorInner<MAX_ORDER>) -> Option<usize> {
+        (Self::min_order()..MAX_ORDER)
+            .rev()
+            .find(|&order| inner.free_lists[order].is_some())
     }
 }
 
@@ -436,12 +588,19 @@ mod tests {
 
     #[test]
     fn test_buddy_merging_cascade() {
-        static mut MEMORY: [u8; 1024] = [0; 1024];
-        static mut BITMAP: [u64; 100] = [0; 100];
+        static mut MEMORY: [usize; 1024 / core::mem::size_of::<usize>()] =
+            [0; 1024 / core::mem::size_of::<usize>()];
+        static mut BITMAP: [u64; 64] = [0; 64];
 
         unsafe {
             // Use addr_of_mut! to get raw pointers, then convert to NonNull
             let memory_ptr = NonNull::new(ptr::addr_of_mut!(MEMORY).cast::<u8>()).unwrap();
+            let bitmap_words = BuddyAllocator::<11>::calculate_bitmap_words_needed(1024);
+            assert!(bitmap_words <= 64);
+            let bitmap_slice = core::slice::from_raw_parts_mut(
+                ptr::addr_of_mut!(BITMAP).cast::<u64>(),
+                bitmap_words,
+            );
             let bitmap_slice =
                 core::slice::from_raw_parts_mut(ptr::addr_of_mut!(BITMAP).cast::<u64>(), 100);
 
