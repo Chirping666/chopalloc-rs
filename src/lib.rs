@@ -51,6 +51,34 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         bitmap_storage: &'static mut [u64],
     ) -> Result<Self> {
         Self::validate_configuration(memory_region, memory_size)?;
+        if MAX_ORDER == 0 {
+            return Err(BuddyAllocatorError::InvalidMemoryRegion {
+                base_addr: memory_region,
+                size: memory_size,
+                reason: "MAX_ORDER must be at least 1",
+            });
+        }
+
+        if memory_size == 0 {
+            return Err(BuddyAllocatorError::InvalidMemoryRegion {
+                base_addr: memory_region,
+                size: memory_size,
+                reason: "memory size must be greater than zero",
+            });
+        }
+
+        let mut bitmap_offsets = [0; MAX_ORDER];
+        let mut current_offset = 0;
+
+        // Calculate the starting offset for each order's bitmap
+        for order in 0..MAX_ORDER {
+            // This order's bitmap starts at the current offset
+            bitmap_offsets[order] = current_offset;
+
+            // Calculate how many words this order needs
+            let block_size = 1 << order;
+            let blocks_count = memory_size / block_size;
+            let words_for_this_order = (blocks_count + 63) / 64;
 
         let bitmap_offsets = Self::build_bitmap_offsets(memory_size, bitmap_storage.len())?;
 
@@ -201,6 +229,8 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
             if block_size > memory_size {
                 break;
             }
+        for order in 0..MAX_ORDER {
+            let block_size = 1 << order; // 2^order bytes per block
 
             let blocks_count = memory_size / block_size;
             let words_for_this_order = (blocks_count + 63) / 64;
@@ -455,6 +485,7 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         order: usize,
     ) -> bool {
         if order >= MAX_ORDER || order < Self::min_order() {
+        if order >= MAX_ORDER {
             return false;
         }
 
@@ -476,6 +507,7 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         is_free: bool,
     ) {
         if order >= MAX_ORDER || order < Self::min_order() {
+        if order >= MAX_ORDER {
             return;
         }
 
@@ -569,6 +601,8 @@ mod tests {
                 ptr::addr_of_mut!(BITMAP).cast::<u64>(),
                 bitmap_words,
             );
+            let bitmap_slice =
+                core::slice::from_raw_parts_mut(ptr::addr_of_mut!(BITMAP).cast::<u64>(), 100);
 
             let allocator = BuddyAllocator::<11>::new(memory_ptr, 1024, bitmap_slice).unwrap();
 
