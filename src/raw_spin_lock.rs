@@ -1,5 +1,5 @@
-use lock_api::{RawMutex, Mutex, GuardSend};
 use core::sync::atomic::{AtomicBool, Ordering};
+use lock_api::{GuardSend, RawMutex};
 
 pub struct RawSpinlock(AtomicBool);
 
@@ -12,7 +12,9 @@ unsafe impl RawMutex for RawSpinlock {
     }
 
     fn try_lock(&self) -> bool {
-        self.0.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
+        self.0
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
     }
 
     unsafe fn unlock(&self) {
