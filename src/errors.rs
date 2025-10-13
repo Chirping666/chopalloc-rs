@@ -30,10 +30,7 @@ pub enum BuddyAllocatorError {
         required_alignment: usize,
     },
     /// Invalid deallocation - block already free (double-free)
-    DoubleFree {
-        ptr: NonNull<u8>,
-        order: usize,
-    },
+    DoubleFree { ptr: NonNull<u8>, order: usize },
     /// Memory region parameters are invalid
     InvalidMemoryRegion {
         base_addr: NonNull<u8>,
@@ -51,21 +48,30 @@ pub enum BuddyAllocatorError {
 impl core::fmt::Display for BuddyAllocatorError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::BitmapStorageTooSmall { required_words, provided_words } => {
-                write!(f, "Bitmap storage too small: need {} words, got {}",
-                       required_words, provided_words)
-            },
-            Self::OutOfMemory { requested_order, largest_available_order } => {
-                match largest_available_order {
-                    Some(largest) => write!(f, "Out of memory: requested 2^{} bytes, largest available 2^{}",
-                                            requested_order, largest),
-                    None => write!(f, "Out of memory: no free blocks available"),
-                }
+            Self::BitmapStorageTooSmall {
+                required_words,
+                provided_words,
+            } => {
+                write!(
+                    f,
+                    "Bitmap storage too small: need {} words, got {}",
+                    required_words, provided_words
+                )
+            }
+            Self::OutOfMemory {
+                requested_order,
+                largest_available_order,
+            } => match largest_available_order {
+                Some(largest) => write!(
+                    f,
+                    "Out of memory: requested 2^{} bytes, largest available 2^{}",
+                    requested_order, largest
+                ),
+                None => write!(f, "Out of memory: no free blocks available"),
             },
             _ => {
                 write!(f, "Buddy Allocator Error: {:?}", self)
-            }
-            // ... other variants
+            } // ... other variants
         }
     }
 }
