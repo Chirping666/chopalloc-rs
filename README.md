@@ -1,4 +1,4 @@
-# Chop-Chop Allocator
+# chopalloc
 A buddy allocator created with the help of generative AI
 
 ## Alignment requirements
