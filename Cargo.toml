@@ -1,5 +1,5 @@
 [package]
-name = "chop-chop-allocator"
+name = "chopalloc"
 version = "0.1.0"
 edition = "2024"
 
