@@ -8,7 +8,11 @@ unsafe impl RawMutex for RawSpinlock {
     type GuardMarker = GuardSend;
 
     fn lock(&self) {
-        while !self.try_lock() {}
+        while !self.try_lock() {
+            // Hint to CPU that we're spinning - reduces power consumption
+            // and improves performance on hyperthreaded CPUs
+            core::hint::spin_loop();
+        }
     }
 
     fn try_lock(&self) -> bool {

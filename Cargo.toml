@@ -1,9 +1,7 @@
 [package]
 name = "chopalloc"
 version = "1.0.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 lock_api = "0.4.13"
-bitvec = { version = "1.0", default-features = false }
-anyhow = "1.0.98"
