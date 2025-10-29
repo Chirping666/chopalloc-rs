@@ -207,7 +207,8 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         let end_addr = current_addr + self.total_size;
 
         while current_addr < end_addr {
-            let block_ptr = NonNull::new(current_addr as *mut u8).unwrap();
+            // SAFETY: current_addr is within our managed region and non-zero
+            let block_ptr = unsafe { NonNull::new_unchecked(current_addr as *mut u8) };
             self.set_block_free(&mut guard, block_ptr, largest_block_order, true);
             Self::push_free_block(&mut guard.free_lists, block_ptr, largest_block_order);
             current_addr += largest_block_size;
@@ -314,7 +315,8 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
             let buddy_offset = current_offset ^ block_size;
             debug_assert!(buddy_offset < self.total_size);
             let buddy_addr = base_addr + buddy_offset;
-            let buddy_ptr = NonNull::new(buddy_addr as *mut u8).unwrap();
+            // SAFETY: buddy_addr is within our managed region and non-zero
+            let buddy_ptr = unsafe { NonNull::new_unchecked(buddy_addr as *mut u8) };
 
             if !self.is_block_free(&guard, buddy_ptr, current_order) {
                 break;
@@ -322,9 +324,13 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
 
             let removed =
                 Self::remove_from_free_list(&mut guard.free_lists, buddy_ptr, current_order);
-            debug_assert!(removed, "Bitmap-freelist inconsistency");
             if !removed {
-                break;
+                // Bitmap says buddy is free but it's not in the free list - data structure corruption
+                return Err(BuddyAllocatorError::InvalidMemoryRegion {
+                    base_addr: self.base_addr,
+                    size: self.total_size,
+                    reason: "bitmap-freelist inconsistency detected",
+                });
             }
 
             self.set_block_free(&mut guard, current_ptr, current_order, false);
@@ -528,7 +534,7 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         FreeBlock::min_order()
     }
 
-    fn min_block_size() -> usize {
+    pub fn min_block_size() -> usize {
         FreeBlock::min_block_size()
     }
 
@@ -536,7 +542,7 @@ impl<const MAX_ORDER: usize> BuddyAllocator<MAX_ORDER> {
         MAX_ORDER - 1
     }
 
-    fn largest_block_size() -> usize {
+    pub fn largest_block_size() -> usize {
         1 << Self::largest_order()
     }
 
@@ -586,15 +592,17 @@ mod tests {
     use core::ptr;
 
     #[repr(align(1024))]
-    struct AlignedMemory([u8; 1024]);
+    struct AlignedMemory1K([u8; 1024]);
+
+    #[repr(align(4096))]
+    struct AlignedMemory4K([u8; 4096]);
 
     #[test]
     fn test_buddy_merging_cascade() {
-        static mut MEMORY: AlignedMemory = AlignedMemory([0; 1024]);
+        static mut MEMORY: AlignedMemory1K = AlignedMemory1K([0; 1024]);
         static mut BITMAP: [u64; 64] = [0; 64];
 
         unsafe {
-            // Use addr_of_mut! to get raw pointers, then convert to NonNull
             let memory_ptr =
                 NonNull::new(ptr::addr_of_mut!(MEMORY.0).cast::<u8>()).unwrap();
             let bitmap_words = BuddyAllocator::<11>::calculate_bitmap_words_needed(1024);
@@ -622,6 +630,344 @@ mod tests {
                 big_ptr.is_ok(),
                 "Should be able to allocate 1024 bytes after merging"
             );
+        }
+    }
+
+    #[test]
+    fn test_out_of_memory() {
+        static mut MEMORY: AlignedMemory1K = AlignedMemory1K([0; 1024]);
+        static mut BITMAP: [u64; 64] = [0; 64];
+
+        unsafe {
+            let memory_ptr =
+                NonNull::new(ptr::addr_of_mut!(MEMORY.0).cast::<u8>()).unwrap();
+            let bitmap_words = BuddyAllocator::<11>::calculate_bitmap_words_needed(1024);
+            let bitmap_slice = core::slice::from_raw_parts_mut(
+                ptr::addr_of_mut!(BITMAP).cast::<u64>(),
+                bitmap_words,
+            );
+
+            let allocator = BuddyAllocator::<11>::new(memory_ptr, 1024, bitmap_slice).unwrap();
+
+            // Allocate entire memory
+            let layout = Layout::from_size_align(1024, 1024).unwrap();
+            let ptr1 = allocator.try_allocate(layout).unwrap();
+
+            // Try to allocate more - should fail
+            let layout_small = Layout::from_size_align(16, 16).unwrap();
+            let result = allocator.try_allocate(layout_small);
+            assert!(matches!(result, Err(BuddyAllocatorError::OutOfMemory { .. })));
+
+            // Free and try again
+            allocator.try_deallocate(ptr1, layout).unwrap();
+            let ptr2 = allocator.try_allocate(layout_small);
+            assert!(ptr2.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_double_free_detection() {
+        static mut MEMORY: AlignedMemory1K = AlignedMemory1K([0; 1024]);
+        static mut BITMAP: [u64; 64] = [0; 64];
+
+        unsafe {
+            let memory_ptr =
+                NonNull::new(ptr::addr_of_mut!(MEMORY.0).cast::<u8>()).unwrap();
+            let bitmap_words = BuddyAllocator::<11>::calculate_bitmap_words_needed(1024);
+            let bitmap_slice = core::slice::from_raw_parts_mut(
+                ptr::addr_of_mut!(BITMAP).cast::<u64>(),
+                bitmap_words,
+            );
+
+            let allocator = BuddyAllocator::<11>::new(memory_ptr, 1024, bitmap_slice).unwrap();
+
+            let layout = Layout::from_size_align(64, 64).unwrap();
+
+            // Allocate two adjacent blocks to prevent merging on free
+            let ptr1 = allocator.try_allocate(layout).unwrap();
+            let ptr2 = allocator.try_allocate(layout).unwrap();
+
+            // Free the first block (won't merge because ptr2 is still allocated)
+            allocator.try_deallocate(ptr1, layout).unwrap();
+
+            // Try to free the same block again - should fail
+            let result = allocator.try_deallocate(ptr1, layout);
+            assert!(matches!(result, Err(BuddyAllocatorError::DoubleFree { .. })));
+
+            // Clean up
+            allocator.try_deallocate(ptr2, layout).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_invalid_pointer_detection() {
+        static mut MEMORY: AlignedMemory1K = AlignedMemory1K([0; 1024]);
+        static mut BITMAP: [u64; 64] = [0; 64];
+
+        unsafe {
+            let memory_ptr =
+                NonNull::new(ptr::addr_of_mut!(MEMORY.0).cast::<u8>()).unwrap();
+            let bitmap_words = BuddyAllocator::<11>::calculate_bitmap_words_needed(1024);
+            let bitmap_slice = core::slice::from_raw_parts_mut(
+                ptr::addr_of_mut!(BITMAP).cast::<u64>(),
+                bitmap_words,
+            );
+
+            let allocator = BuddyAllocator::<11>::new(memory_ptr, 1024, bitmap_slice).unwrap();
+
+            // Try to free a pointer outside our region
+            let invalid_ptr = NonNull::new(0x1000 as *mut u8).unwrap();
+            let layout = Layout::from_size_align(64, 64).unwrap();
+            let result = allocator.try_deallocate(invalid_ptr, layout);
+            assert!(matches!(result, Err(BuddyAllocatorError::InvalidPointer { .. })));
+        }
+    }
+
+    #[test]
+    fn test_invalid_alignment_detection() {
+        static mut MEMORY: AlignedMemory1K = AlignedMemory1K([0; 1024]);
+        static mut BITMAP: [u64; 64] = [0; 64];
+
+        unsafe {
+            let memory_ptr =
+                NonNull::new(ptr::addr_of_mut!(MEMORY.0).cast::<u8>()).unwrap();
+            let bitmap_words = BuddyAllocator::<11>::calculate_bitmap_words_needed(1024);
+            let bitmap_slice = core::slice::from_raw_parts_mut(
+                ptr::addr_of_mut!(BITMAP).cast::<u64>(),
+                bitmap_words,
+            );
+
+            let allocator = BuddyAllocator::<11>::new(memory_ptr, 1024, bitmap_slice).unwrap();
+
+            // Allocate a block
+            let layout = Layout::from_size_align(64, 64).unwrap();
+            allocator.try_allocate(layout).unwrap();
+
+            // Try to free with wrong alignment (offset by 1 byte)
+            let base_addr = memory_ptr.as_ptr() as usize;
+            let misaligned_ptr = NonNull::new((base_addr + 1) as *mut u8).unwrap();
+            let result = allocator.try_deallocate(misaligned_ptr, layout);
+            assert!(matches!(
+                result,
+                Err(BuddyAllocatorError::InvalidAlignment { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_fragmentation_and_coalescing() {
+        static mut MEMORY: AlignedMemory1K = AlignedMemory1K([0; 1024]);
+        static mut BITMAP: [u64; 64] = [0; 64];
+
+        unsafe {
+            let memory_ptr =
+                NonNull::new(ptr::addr_of_mut!(MEMORY.0).cast::<u8>()).unwrap();
+            let bitmap_words = BuddyAllocator::<11>::calculate_bitmap_words_needed(1024);
+            let bitmap_slice = core::slice::from_raw_parts_mut(
+                ptr::addr_of_mut!(BITMAP).cast::<u64>(),
+                bitmap_words,
+            );
+
+            let allocator = BuddyAllocator::<11>::new(memory_ptr, 1024, bitmap_slice).unwrap();
+
+            // Allocate ALL memory as small blocks to fill it completely
+            let layout = Layout::from_size_align(64, 64).unwrap();
+            let ptrs: [NonNull<u8>; 16] = [
+                allocator.try_allocate(layout).unwrap(),
+                allocator.try_allocate(layout).unwrap(),
+                allocator.try_allocate(layout).unwrap(),
+                allocator.try_allocate(layout).unwrap(),
+                allocator.try_allocate(layout).unwrap(),
+                allocator.try_allocate(layout).unwrap(),
+                allocator.try_allocate(layout).unwrap(),
+                allocator.try_allocate(layout).unwrap(),
+                allocator.try_allocate(layout).unwrap(),
+                allocator.try_allocate(layout).unwrap(),
+                allocator.try_allocate(layout).unwrap(),
+                allocator.try_allocate(layout).unwrap(),
+                allocator.try_allocate(layout).unwrap(),
+                allocator.try_allocate(layout).unwrap(),
+                allocator.try_allocate(layout).unwrap(),
+                allocator.try_allocate(layout).unwrap(),
+            ];
+
+            // Free every other block to create fragmentation
+            allocator.try_deallocate(ptrs[1], layout).unwrap();
+            allocator.try_deallocate(ptrs[3], layout).unwrap();
+            allocator.try_deallocate(ptrs[5], layout).unwrap();
+            allocator.try_deallocate(ptrs[7], layout).unwrap();
+            allocator.try_deallocate(ptrs[9], layout).unwrap();
+            allocator.try_deallocate(ptrs[11], layout).unwrap();
+            allocator.try_deallocate(ptrs[13], layout).unwrap();
+            allocator.try_deallocate(ptrs[15], layout).unwrap();
+
+            // Should not be able to allocate a 256-byte block (fragmented - no 4 contiguous blocks)
+            let large_layout = Layout::from_size_align(256, 256).unwrap();
+            let result = allocator.try_allocate(large_layout);
+            assert!(result.is_err(), "Should fail due to fragmentation");
+
+            // Free remaining blocks to enable coalescing
+            allocator.try_deallocate(ptrs[0], layout).unwrap();
+            allocator.try_deallocate(ptrs[2], layout).unwrap();
+            allocator.try_deallocate(ptrs[4], layout).unwrap();
+            allocator.try_deallocate(ptrs[6], layout).unwrap();
+            allocator.try_deallocate(ptrs[8], layout).unwrap();
+            allocator.try_deallocate(ptrs[10], layout).unwrap();
+            allocator.try_deallocate(ptrs[12], layout).unwrap();
+            allocator.try_deallocate(ptrs[14], layout).unwrap();
+
+            // Now should be able to allocate large block (everything coalesced)
+            let result = allocator.try_allocate(large_layout);
+            assert!(result.is_ok(), "Should succeed after coalescing");
+        }
+    }
+
+    #[test]
+    fn test_alignment_requirement() {
+        static mut MEMORY: AlignedMemory4K = AlignedMemory4K([0; 4096]);
+        static mut BITMAP: [u64; 256] = [0; 256];
+
+        unsafe {
+            let memory_ptr =
+                NonNull::new(ptr::addr_of_mut!(MEMORY.0).cast::<u8>()).unwrap();
+            let bitmap_words = BuddyAllocator::<13>::calculate_bitmap_words_needed(4096);
+            let bitmap_slice = core::slice::from_raw_parts_mut(
+                ptr::addr_of_mut!(BITMAP).cast::<u64>(),
+                bitmap_words,
+            );
+
+            let allocator = BuddyAllocator::<13>::new(memory_ptr, 4096, bitmap_slice).unwrap();
+
+            // Request 1 byte with 512-byte alignment
+            // Should allocate a 512-byte block aligned to 512
+            let layout = Layout::from_size_align(1, 512).unwrap();
+            let ptr = allocator.try_allocate(layout).unwrap();
+
+            // Verify alignment
+            assert_eq!(ptr.as_ptr() as usize % 512, 0);
+
+            allocator.try_deallocate(ptr, layout).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_zero_sized_allocation_rejected() {
+        static mut MEMORY: AlignedMemory1K = AlignedMemory1K([0; 1024]);
+        static mut BITMAP: [u64; 64] = [0; 64];
+
+        unsafe {
+            let memory_ptr =
+                NonNull::new(ptr::addr_of_mut!(MEMORY.0).cast::<u8>()).unwrap();
+            let bitmap_words = BuddyAllocator::<11>::calculate_bitmap_words_needed(1024);
+            let bitmap_slice = core::slice::from_raw_parts_mut(
+                ptr::addr_of_mut!(BITMAP).cast::<u64>(),
+                bitmap_words,
+            );
+
+            let allocator = BuddyAllocator::<11>::new(memory_ptr, 1024, bitmap_slice).unwrap();
+
+            let layout = Layout::from_size_align(0, 1).unwrap();
+            let result = allocator.try_allocate(layout);
+            assert!(matches!(result, Err(BuddyAllocatorError::InvalidLayout { .. })));
+        }
+    }
+
+    #[test]
+    fn test_allocation_too_large() {
+        static mut MEMORY: AlignedMemory1K = AlignedMemory1K([0; 1024]);
+        static mut BITMAP: [u64; 64] = [0; 64];
+
+        unsafe {
+            let memory_ptr =
+                NonNull::new(ptr::addr_of_mut!(MEMORY.0).cast::<u8>()).unwrap();
+            let bitmap_words = BuddyAllocator::<11>::calculate_bitmap_words_needed(1024);
+            let bitmap_slice = core::slice::from_raw_parts_mut(
+                ptr::addr_of_mut!(BITMAP).cast::<u64>(),
+                bitmap_words,
+            );
+
+            let allocator = BuddyAllocator::<11>::new(memory_ptr, 1024, bitmap_slice).unwrap();
+
+            // Try to allocate more than the largest block size
+            let layout = Layout::from_size_align(2048, 1).unwrap();
+            let result = allocator.try_allocate(layout);
+            assert!(matches!(
+                result,
+                Err(BuddyAllocatorError::AllocationTooLarge { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_invalid_memory_region_unaligned() {
+        static mut MEMORY: [u8; 1024] = [0; 1024];
+        static mut BITMAP: [u64; 64] = [0; 64];
+
+        unsafe {
+            // Try to create allocator with unaligned memory
+            let base_ptr = ptr::addr_of_mut!(MEMORY).cast::<u8>();
+            let unaligned_ptr = NonNull::new(base_ptr.add(1)).unwrap();
+            let bitmap_words = BuddyAllocator::<11>::calculate_bitmap_words_needed(1024);
+            let bitmap_slice = core::slice::from_raw_parts_mut(
+                ptr::addr_of_mut!(BITMAP).cast::<u64>(),
+                bitmap_words,
+            );
+
+            let result = BuddyAllocator::<11>::new(unaligned_ptr, 1024, bitmap_slice);
+            assert!(matches!(
+                result,
+                Err(BuddyAllocatorError::InvalidMemoryRegion { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_bitmap_size_calculation() {
+        // For 1024 bytes with MAX_ORDER=11, min block size is likely 8 or 16
+        let bitmap_words = BuddyAllocator::<11>::calculate_bitmap_words_needed(1024);
+        assert!(bitmap_words > 0);
+        assert!(bitmap_words < 100); // Sanity check
+
+        // Larger memory should need more bitmap words
+        let bitmap_words_large = BuddyAllocator::<13>::calculate_bitmap_words_needed(4096);
+        assert!(bitmap_words_large > bitmap_words);
+    }
+
+    #[test]
+    fn test_bitmap_storage_too_small() {
+        static mut MEMORY: AlignedMemory1K = AlignedMemory1K([0; 1024]);
+        static mut BITMAP: [u64; 2] = [0; 2]; // Intentionally too small
+
+        unsafe {
+            let memory_ptr =
+                NonNull::new(ptr::addr_of_mut!(MEMORY.0).cast::<u8>()).unwrap();
+            let bitmap_slice =
+                core::slice::from_raw_parts_mut(ptr::addr_of_mut!(BITMAP).cast::<u64>(), 2);
+
+            let result = BuddyAllocator::<11>::new(memory_ptr, 1024, bitmap_slice);
+            assert!(matches!(
+                result,
+                Err(BuddyAllocatorError::BitmapStorageTooSmall { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_max_order_zero_rejected() {
+        static mut MEMORY: AlignedMemory1K = AlignedMemory1K([0; 1024]);
+        static mut BITMAP: [u64; 64] = [0; 64];
+
+        unsafe {
+            let memory_ptr =
+                NonNull::new(ptr::addr_of_mut!(MEMORY.0).cast::<u8>()).unwrap();
+            let bitmap_slice =
+                core::slice::from_raw_parts_mut(ptr::addr_of_mut!(BITMAP).cast::<u64>(), 64);
+
+            let result = BuddyAllocator::<0>::new(memory_ptr, 1024, bitmap_slice);
+            assert!(matches!(
+                result,
+                Err(BuddyAllocatorError::InvalidMemoryRegion { .. })
+            ));
         }
     }
 }
