@@ -44,6 +44,19 @@ struct BuddyAllocatorInner<'a, const MAX_ORDER: usize> {
 }
 
 // Main allocator structure
+//
+// # Choosing MAX_ORDER
+//
+// `MAX_ORDER` determines the number of block size levels and must be chosen based on your memory size:
+//
+// **Formula**: `MAX_ORDER = log2(memory_size_in_bytes) + 1`
+//
+// Examples:
+// - 1 KB (1024 bytes) → MAX_ORDER = 11  (2^10 = 1024, so 11 orders: 0..=10)
+// - 4 KB (4096 bytes) → MAX_ORDER = 13  (2^12 = 4096, so 13 orders: 0..=12)
+// - 64 KB (65536 bytes) → MAX_ORDER = 17 (2^16 = 65536, so 17 orders: 0..=16)
+//
+// The allocator manages blocks from size 2^0 up to 2^(MAX_ORDER-1) bytes.
 pub struct BuddyAllocator<'a, const MAX_ORDER: usize> {
     inner: Mutex<RawSpinlock, BuddyAllocatorInner<'a, MAX_ORDER>>,
     base_addr: NonNull<u8>,

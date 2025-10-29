@@ -5,6 +5,19 @@ A minimal, no_std buddy allocator for embedded systems and bare-metal environmen
 
 - **`bitmap` (default)**: Enables O(1) buddy checking using a bitmap. Disable for pure free-list implementation (O(n) checks, less memory overhead).
 
+## Choosing MAX_ORDER
+
+The `MAX_ORDER` const generic parameter determines how many block size levels the allocator manages.
+
+**Formula**: `MAX_ORDER = log2(memory_size_in_bytes) + 1`
+
+Examples:
+- 1 KB (1024 bytes) → `BuddyAllocator::<11>` (2^10 = 1024)
+- 4 KB (4096 bytes) → `BuddyAllocator::<13>` (2^12 = 4096)
+- 64 KB (65536 bytes) → `BuddyAllocator::<17>` (2^16 = 65536)
+
+The allocator will manage blocks from 2^0 up to 2^(MAX_ORDER-1) bytes.
+
 ## Usage
 
 ```rust
